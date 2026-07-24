@@ -22,6 +22,7 @@
 #   * rq = 1 - sp_res (res is inverted; default 0.9 -> rq 0.1)
 #   * filter freq = midicps(cutoff_min=30) + filt_env * midicps(cutoff)
 #   * amplitude env and filter env share the same shape
+#   * amp env is applied AFTER the filter (gates the resonance tail)
 #   * attack 0 = instant on
 
 import math
@@ -144,7 +145,6 @@ def _blk_saw(out: ptr16, ob: int, n: int, st: ptr32, cf: ptr32):
         elif ph > (0x40000000 - dph):
             u = (ph - 0x40000000) // dq             # Q15 in (-1,0)
             s -= ((((u * u) >> 15) + u + u + 32768) * 4096) >> 15
-        s = (s * (g >> 8)) >> 12                    # env/slicer gain
         # Chamberlin SVF, 2x oversampled (stable to ~7 kHz cutoff)
         lp += (f * bp) >> 14
         hp = s - lp - ((dm * bp) >> 14)
@@ -160,7 +160,9 @@ def _blk_saw(out: ptr16, ob: int, n: int, st: ptr32, cf: ptr32):
             bp = 65535
         elif bp < -65536:
             bp = -65536
-        o = (lp * mg) >> 12
+        # SC order: amp env applied AFTER the filter (so the resonance is
+        # gated by the note, instead of ringing on after it ends)
+        o = (lp * (((g >> 8) * mg) >> 12)) >> 12
         # cubic soft clip: y = 1.5u - u^3/2 (normalised), ceiling at 32768
         if o > 32768:
             o = 32768
@@ -218,7 +220,6 @@ def _blk_pulse3(out: ptr16, ob: int, n: int, st: ptr32, cf: ptr32):
             s += 1366
         else:
             s -= 1366
-        s = (s * (g >> 8)) >> 12
         lp += (f * bp) >> 14
         hp = s - lp - ((dm * bp) >> 14)
         bp += (f * hp) >> 14
@@ -233,7 +234,7 @@ def _blk_pulse3(out: ptr16, ob: int, n: int, st: ptr32, cf: ptr32):
             bp = 65535
         elif bp < -65536:
             bp = -65536
-        o = (lp * mg) >> 12
+        o = (lp * (((g >> 8) * mg) >> 12)) >> 12   # amp env post-filter
         # cubic soft clip: y = 1.5u - u^3/2 (normalised), ceiling at 32768
         if o > 32768:
             o = 32768
@@ -362,7 +363,7 @@ class StepRenderer:
     """Renders one sequencer Step into an int16 mono LE buffer at 22050 Hz."""
 
     TB303_MG = 3000      # make-up gains, tuned so kick and lead balance
-    PROPHET_MG = 5600
+    PROPHET_MG = 6200
     KICK_G = 256         # Q8, unity: drums are pre-normalised at load
 
     def __init__(self):
@@ -373,6 +374,7 @@ class StepRenderer:
         self.saw_st = array('i', [0] * 4)
         self.pls_st = array('i', [0] * 8)
         self.cf = array('i', [0] * 9)       # packed per-block coefficients
+        self.echo = None                    # S3 pseudo-reverb feedback buffer
 
     def render(self, step):
         dur, voice, midi, release, cutoff, sp_res, kick_amp, slic = step[:8]
@@ -395,6 +397,15 @@ class StepRenderer:
         if voice is not None and release > 0.0:
             self._render_voice(buf, ns, voice, midi, release,
                                cutoff, sp_res, slic)
+
+        # --- S3 pseudo-reverb: with_fx :reverb approximated as a one-step
+        # (125 ms) feedback echo, prophet section only ---------------------
+        if voice == 'prophet':
+            if self.echo is not None and len(self.echo) == len(buf):
+                _blk_mix(buf, 0, self.echo, 0, ns, 115)     # ~0.45 feedback
+            self.echo = bytes(buf)
+        else:
+            self.echo = None
         return buf
 
     def _render_voice(self, buf, ns, voice, midi, release, cutoff, sp_res, slic):
