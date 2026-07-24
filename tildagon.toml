@@ -1,0 +1,10 @@
+[app]
+name = "World o Techno"
+menu = "Music"
+license = "MIT"
+
+[entry]
+class = "WorldOTechno"
+
+[metadata]
+description = "GPS-driven acid techno. Port of jarkman's world-o-techno. Needs a PCM5102A I2S DAC hexpansion."
