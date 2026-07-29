@@ -19,15 +19,6 @@ try:
     import imu
 except ImportError:
     imu = None
-try:
-    from tildagonos import tildagonos
-except ImportError:
-    tildagonos = None
-try:
-    from system.eventbus import eventbus
-    from system.patterndisplay.events import PatternDisable, PatternEnable
-except ImportError:
-    eventbus = None
 
 # speccy palette
 CYAN = [0, 1, 1]
@@ -71,7 +62,8 @@ class WorldOTechno(app.App):
         self._pg_channel = None
         self.error = None
         self._theta = 0.0          # ring rotation from badge tilt
-        self.level = 0.0           # audio level for the leds
+        self._title = None         # cached title characters, built once
+        self._sim_acc = b""        # sim: batch steps into bigger buffers
 
     # ---------------- menus ----------------
 
@@ -136,16 +128,19 @@ class WorldOTechno(app.App):
         self.renderer = StepRenderer()
         self.seq = Sequencer(self.gps)
         self.running = True
-        if eventbus:
-            eventbus.emit(PatternDisable())   # our leds now
         self._tasks.append(asyncio.create_task(self._audio_task()))
         if isinstance(self.gps, NmeaGps):
             self._tasks.append(asyncio.create_task(self._gps_task()))
 
     async def _play_sim(self, buf):
-        """sim playback, queue one step ahead for gapless audio"""
+        """sim playback. batch steps into ~400ms sounds so a slow ui frame
+        cant starve pygames one deep queue (sounds like smeared timing)"""
+        self._sim_acc += bytes(buf)
+        if len(self._sim_acc) < 2 * int(SR * 0.4):
+            return
+        snd = self._pygame.mixer.Sound(buffer=self._sim_acc)
+        self._sim_acc = b""
         ch = self._pg_channel
-        snd = self._pygame.mixer.Sound(buffer=bytes(buf))
         if not ch.get_busy():
             ch.play(snd)
             return
@@ -164,25 +159,12 @@ class WorldOTechno(app.App):
                 for step in steps:
                     if not self.running:
                         return
-                    buf = None
-                    if swriter is not None or self._pg_channel is not None:
-                        buf = self.renderer.render(step)
-                        p = 0
-                        for i in range(0, len(buf) - 1, 512):
-                            v = buf[i] | (buf[i + 1] << 8)
-                            if v >= 32768:
-                                v -= 65536
-                            if v > p:
-                                p = v
-                            elif -v > p:
-                                p = -v
-                        if p / 32768 > self.level:
-                            self.level = p / 32768
                     if swriter is not None:
+                        buf = self.renderer.render(step)
                         swriter.write(buf)
                         await swriter.drain()
                     elif self._pg_channel is not None:
-                        await self._play_sim(buf)
+                        await self._play_sim(self.renderer.render(step))
                     else:
                         await asyncio.sleep_ms(int(step[0] * 1000))
                 await asyncio.sleep_ms(0)
@@ -218,15 +200,6 @@ class WorldOTechno(app.App):
             except Exception:
                 pass
             self._pg_channel = None
-        if tildagonos:
-            try:
-                for i in range(1, 13):
-                    tildagonos.leds[i] = (0, 0, 0)
-                tildagonos.leds.write()
-            except Exception:
-                pass
-        if eventbus:
-            eventbus.emit(PatternEnable())    # give the rainbow back
 
     # ---------------- framework ----------------
 
@@ -251,19 +224,6 @@ class WorldOTechno(app.App):
                     self._theta += 0.15 * d
             except Exception:
                 pass
-        # leds pulse with the music, alternting speccy colours
-        if tildagonos and self.running:
-            try:
-                b = self.level
-                for i in range(1, 13):
-                    c = MAGENTA if i % 2 else CYAN
-                    tildagonos.leds[i] = (int(c[0] * 255 * b),
-                                          int(c[1] * 255 * b),
-                                          int(c[2] * 255 * b))
-                tildagonos.leds.write()
-            except Exception:
-                pass
-        self.level *= 0.82
 
     def _write_phrase(self, ctx, params, bold=False):
         # pikesleys Phrase wants an app with .overlays, give it a decoy.
@@ -312,13 +272,26 @@ class WorldOTechno(app.App):
                 ctx.text(ch)
                 ctx.restore()
             ctx.restore()
-            # big chunky pikesley style title
-            self._write_phrase(ctx, {"text": "world", "scale": 3.5,
-                                     "y-offset": -48, "colour": MAGENTA}, bold=True)
-            self._write_phrase(ctx, {"text": "o", "scale": 3.5,
-                                     "y-offset": 0, "colour": YELLOW}, bold=True)
-            self._write_phrase(ctx, {"text": "techno", "scale": 3.5,
-                                     "y-offset": 48, "colour": CYAN}, bold=True)
+            # big chunky pikesley style title, built once and cached
+            if self._title is None:
+                class _O:
+                    pass
+                o = _O()
+                o.overlays = []
+                Phrase({"text": "world", "scale": 3.5, "y-offset": -48,
+                        "colour": MAGENTA}).write(o)
+                Phrase({"text": "o", "scale": 3.5, "y-offset": 0,
+                        "colour": YELLOW}).write(o)
+                Phrase({"text": "techno", "scale": 3.5, "y-offset": 48,
+                        "colour": CYAN}).write(o)
+                self._title = o.overlays
+            d = 3.5 * 0.6
+            for c in self._title:
+                for ox, oy in ((0, 0), (d, 0), (0, d), (d, d)):
+                    ctx.save()
+                    ctx.translate(ox, oy)
+                    c.draw(ctx)
+                    ctx.restore()
         else:
             ctx.rgb(1, 0.8, 0).move_to(0, -20).text("waiting for fix...")
             sats = self.gps.satellites() if self.gps else 0
