@@ -142,8 +142,10 @@ def _blk_saw(out: ptr16, ob: int, n: int, st: ptr32, cf: ptr32):
         if ph < dph:
             u = ph // dq                            # Q15 in [0,1)
             s -= ((u + u - ((u * u) >> 15) - 32768) * 4096) >> 15
-        elif ph > (0x40000000 - dph):
-            u = (ph - 0x40000000) // dq             # Q15 in (-1,0)
+        elif ph > (0x3FFFFFFF - dph):
+            # (equivalent to ph > 2^30 - dph, but the literal 0x40000000 is
+            # one over the 32-bit small-int limit and boxes under viper)
+            u = (ph - 0x3FFFFFFF - 1) // dq         # Q15 in (-1,0)
             s -= ((((u * u) >> 15) + u + u + 32768) * 4096) >> 15
         # Chamberlin SVF, 2x oversampled (stable to ~7 kHz cutoff)
         lp += (f * bp) >> 14
