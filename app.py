@@ -1,11 +1,3 @@
-# world-o-techno for the Tildagon badge.
-# GPS-driven acid techno, faithfully ported from jarkman's Sonic Pi original.
-#
-# Hardware: PCM5102A I2S DAC hexpansion (BCK/LRCK/DIN on HS1/HS2/HS3, SCK
-# strapped to GND) + optional GPS hexpansion (NMEA over UART on HS pins).
-#
-# Runs entirely inside the stock Tildagon MicroPython firmware - no custom
-# firmware build, no C modules. Audio-rate DSP is @micropython.viper.
 
 import asyncio
 
@@ -21,7 +13,6 @@ from .sequencer import Sequencer
 from .synth import StepRenderer, SR
 from .gps_source import MockGps, NmeaGps
 
-# PCM5102A wiring on the DAC hexpansion (HexpansionConfig.pin index):
 DAC_BCK_PIN = 0    # HS1 -> BCK
 DAC_LRCK_PIN = 1   # HS2 -> LCK / LRCK / WS
 DAC_DIN_PIN = 2    # HS3 -> DIN
@@ -91,9 +82,7 @@ class WorldOTechno(app.App):
             I2S = None
         self._pg_channel = None
         if I2S is None or not hasattr(I2S, 'TX'):
-            # Badge simulator: no I2S peripheral. The sim is a pygame app,
-            # so play through pygame.mixer if we can; otherwise run silently
-            # in real time so the sequencer/UI still work.
+            # sim has no I2S but it is pygame, so play thru pygame.mixer
             self.sim_mode = True
             self.i2s = None
             try:
@@ -128,13 +117,12 @@ class WorldOTechno(app.App):
             self._tasks.append(asyncio.create_task(self._gps_task()))
 
     async def _play_sim(self, buf):
-        """Simulator playback: queue one step ahead on a pygame channel."""
+        """sim playback, queue one step ahead for gapless audio"""
         ch = self._pg_channel
         snd = self._pygame.mixer.Sound(buffer=bytes(buf))
         if not ch.get_busy():
             ch.play(snd)
             return
-        # wait for the queue slot, then queue for gapless playback
         while ch.get_queue() is not None:
             await asyncio.sleep_ms(5)
         ch.queue(snd)
@@ -157,7 +145,6 @@ class WorldOTechno(app.App):
                     elif self._pg_channel is not None:
                         await self._play_sim(self.renderer.render(step))
                     else:
-                        # no audio device at all: keep musical time silently
                         await asyncio.sleep_ms(int(step[0] * 1000))
                 await asyncio.sleep_ms(0)
         except Exception as e:

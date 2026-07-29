@@ -1,23 +1,6 @@
-# world-o-techno sequencer - faithful port of world-o-techno.rb (Sonic Pi v2.6)
-# by jarkman (Richard Sewell), hacked around by RS & JHR.
-#
-# Pure Python, no imports beyond sc_rng - identical behaviour under CPython
-# (sim / unit tests) and MicroPython (badge).
-#
-# Yields Step tuples:
-#   (dur_s, voice, midi_note, release_s, cutoff_midi, sp_res, kick_amp, slicer_period)
-#     voice          'tb303' | 'prophet' | None (kick-only step)
-#     midi_note      MIDI note number or None
-#     release_s      Sonic Pi release (attack is always 0)
-#     cutoff_midi    Sonic Pi cutoff (MIDI, may be float in section 4)
-#     sp_res         Sonic Pi res param (rq = 1 - sp_res in the synth)
-#     kick_amp       0.0 = no kick this step, else relative kick gain
-#     slicer_period  0 = no slicer, else slicer LFO period in seconds (mix 0.75)
 
 from .sc_rng import SCRng
 
-# in pitch order to give a systematic variation as you move
-# :a1 :c1 :e1 :a2 :c2 :e2 :a3 :c3 :e3 :a4 :c4 :e4  (Sonic Pi octave numbering)
 CHORD_MIDI_ROOTS = [
     33, 24, 28,   # a1, c1, e1
     45, 36, 40,   # a2, c2, e2
@@ -51,8 +34,6 @@ def lon_int(lon):
 
 
 def location_release(r, la, lo):
-    # Ruby integer division: ((la+lo)%30)/30 == 0 always, so factor is 0.5.
-    # Kept written out faithfully anyway.
     factor = (la + lo) % 30
     factor = (factor // 30) + 0.5
     return r * factor
@@ -75,13 +56,10 @@ class Sequencer:
     def cycle(self):
         gps = self.gps
 
-        # ---- Section 1: 4 x (4 bars x 4 notes), :tb303, minor -------------
         self.section = 1
         for i in range(4):
             for _bar in range(4):
                 la, lo = self._pos()
-                # use_random_seed long (lonInt%100) is set in the original but
-                # overwritten before any rand is consumed - no effect.
                 root = choose_chord_root(lo % 656753)
                 self.chord_root = root
                 rng = SCRng(lo % 257867)
@@ -96,7 +74,6 @@ class Sequencer:
         if not gps.has_fix():
             return
 
-        # ---- Section 2: 8 bars, :tb303, res follows speed ------------------
         self.section = 2
         for i in range(8):
             la, lo = self._pos()
@@ -115,8 +92,6 @@ class Sequencer:
         if not gps.has_fix():
             return
 
-        # ---- Section 3: 8 bars, :prophet, chord from LATITUDE ---------------
-        # (with_fx :reverb in the original - not implemented yet)
         self.section = 3
         for _m in range(8):
             la, lo = self._pos()
@@ -134,7 +109,6 @@ class Sequencer:
         if not gps.has_fix():
             return
 
-        # ---- Section 4: 4 bars, :tb303, MAJOR, slicer, sleep 0.25 -----------
         self.section = 4
         for _b in range(4):
             la, lo = self._pos()
@@ -143,7 +117,6 @@ class Sequencer:
             self.chord_root = root
             notes = major(root)
             rel = location_release(0.1, la, lo)
-            # slat = latInt.modulo(1) + 0.1 -> latInt is an integer, so 0.1
             slicer_period = (la % 1) + 0.1
             for k in range(4):
                 n = rng.choose(notes)

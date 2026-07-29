@@ -1,7 +1,5 @@
-# SuperCollider-compatible RNG (Tausworthe LFSR + Jenkins hash).
-# This is the verified implementation from the porting notes:
-# seed 196988 -> first bar [C5/87, E5/72, A4/69, C5/70], matching Sonic Pi.
-# Pure integer maths - runs identically under CPython and MicroPython.
+# Sorry for the biblically accurate rng stuff, this is a direct port of SC's rng code (to the best of my ability).
+# I do not understand how it works, good luck and godspeed.
 
 
 def _sc_hash(x):

@@ -1,40 +1,21 @@
-# world-o-techno badge synth - pure MicroPython, no custom firmware needed.
-#
-# Strategy (mirrors how SuperCollider actually works):
-#   * audio rate  : @micropython.viper integer inner loops (compiled to native
-#                   Xtensa code on the ESP32-S3) - saw/pulse osc + SC RLPF
-#                   biquad + linearly-ramped gain, mixed straight into an
-#                   int16 mono buffer.
-#   * control rate: plain Python every BLOCK samples - envelope lookup,
-#                   filter coefficient recalculation (SC recalculates RLPF
-#                   coefficients at control rate too), slicer LFO, prophet PWM.
-#
-# Filter is a resonant low-pass (Chamberlin SVF, 2x oversampled) with SC's
-# rq = 1/Q convention. A fixed-point direct-form biquad of SC's RLPF was
-# tried first and is numerically unstable at the 46 Hz tb303 cutoff floor
-# (a0 quantises to zero); the SVF is what hardware 303 clones (e.g. AcidBox)
-# use for the same reason. Cutoff is clamped to 7 kHz for SVF stability.
-#
-# Envelope is SC env_curve=2 (concave exponential), via a 512-entry Q14 table:
-#   env(t) = 1 - (e^(2t) - 1) / (e^2 - 1)
-#
-# tb303 facts honoured (from retro.clj analysis in the porting notes):
-#   * rq = 1 - sp_res (res is inverted; default 0.9 -> rq 0.1)
-#   * filter freq = midicps(cutoff_min=30) + filt_env * midicps(cutoff)
-#   * amplitude env and filter env share the same shape
-#   * amp env is applied AFTER the filter (gates the resonance tail)
-#   * attack 0 = instant on
+# synth for world-o-techno on the tildagon. viper inner loops for audio
+# rate, python for control rate (same split supercollider uses).
+# filter is an oversampled SVF - tried porting SC's actual RLPF biquad
+# but it falls apart in fixed point at low cuttoff (a0 rounds to 0).
+# env is SC curve=2: 1-(e^2t -1)/(e^2 -1), 512 entry Q14 table.
+# NB amp env goes AFTER the filter or the resonance rings past note end
+
+# I'm not a music / synth person, this was reverse engineered from the sonic pi synthdefs and the model village recording.
+# Did my best to document here as I go but this is a lot of trial and error and ear tuning.
 
 import math
 from array import array
 
 import sys
 
-# Viper is only available on real MicroPython, where @micropython.viper is
-# recognised by the COMPILER (it is not a runtime attribute - hasattr says
-# False even when it works), so probe by compiling a tiny function. The
-# Tildagon simulator runs CPython, where the decorator IS a runtime lookup
-# and annotations are evaluated, so a dummy decorator + ptr names are needed.
+# viper only exists on real micropython and its a compile time thing so
+# hasattr doesnt work - have to probe by actually compiling somthing.
+# sim is cpython so needs the dummy decorator + ptr shims
 _VIPER = False
 if sys.implementation.name == 'micropython':
     import micropython
@@ -51,7 +32,7 @@ if not _VIPER:               # CPython tests / badge simulator: plain-Python
     micropython = _Dummy()
 
     def ptr16(x):
-        # unsigned view == viper ptr16 semantics (kernels sign-extend manually)
+        # unsigned like viper ptr16, kernels sign extend themselves
         return memoryview(x).cast('H') if isinstance(x, (bytearray, bytes, memoryview)) else x
 
     def ptr32(x):
@@ -64,9 +45,6 @@ BLOCK = 128
 ENV_N = 512
 _PH1 = (1 << 30) / SR        # phase increment per Hz (30-bit phase)
 
-# ---------------------------------------------------------------------------
-# One-time tables (Python floats are fine here, it only runs at init)
-# ---------------------------------------------------------------------------
 
 _E2M1 = math.exp(2.0) - 1.0
 ENV_TAB = array('h', [0] * ENV_N)          # Q14, 16384 -> 0
@@ -84,9 +62,7 @@ CUTOFF_MIN_HZ = midicps(30)                # ~46.25 Hz, tb303 default cutoff_min
 
 
 def _make_kick():
-    """Stand-in for :bd_fat - exponential pitch sweep 160->48 Hz with a click.
-    Precomputed once; mixed in with per-step gain (also reused, quieter/louder,
-    for :bd_haus / :bd_boom in satellite mode)."""
+    """fallback kick if the sample files are missing"""
     dur = 0.20
     n = int(SR * dur)
     buf = bytearray(2 * n)
@@ -105,25 +81,12 @@ def _make_kick():
     return buf
 
 
-# ---------------------------------------------------------------------------
-# viper audio-rate kernels
-# ---------------------------------------------------------------------------
-# Fixed point conventions:
-#   osc sample     +-4096            (Q12 of full scale)
-#   filter coeffs  Q12
-#   filter states  int32, clamped to +-131071
-#   gain g0/g1     Q12 (env * slicer * amp), ramped linearly across the block
-#   mg             Q10 output make-up gain into the int16 mix buffer
 
 @micropython.viper
 def _blk_saw(out: ptr16, ob: int, n: int, st: ptr32, cf: ptr32):
-    # st: [0]=phase [1]=dphase [2]=lp [3]=bp
-    # cf: [0]=f (Q14, for 2xSR)  [1]=damp (Q14, =rq)
-    #     [2]=g0 [3]=g1 (Q12)    [4]=mg (Q12)
     ph = int(st[0]); dph = int(st[1])
-    # filter states are stored with a +65536 bias: viper ptr32 loads are
-    # unsigned, so raw negative values would read back as huge positives
-    # on 64-bit ports (unix/sim testing); biased storage is portable.
+    # filter state stored +65536: viper ptr32 loads are UNSIGNED so raw
+    # negative state comes back as a huge positive on 64bit ports
     lp = int(st[2]) - 65536; bp = int(st[3]) - 65536
     f = int(cf[0]); dm = int(cf[1])
     g0 = int(cf[2]); g1 = int(cf[3]); mg = int(cf[4])
@@ -138,13 +101,13 @@ def _blk_saw(out: ptr16, ob: int, n: int, st: ptr32, cf: ptr32):
     while i < n:
         ph = (ph + dph) & 0x3FFFFFFF
         s = (ph >> 17) - 4096                       # saw, +-4096
-        # polyBLEP: smooth the wrap discontinuity (kills alias fizz)
+        # polyBLEP the wrap point, kills alias fizz
         if ph < dph:
             u = ph // dq                            # Q15 in [0,1)
             s -= ((u + u - ((u * u) >> 15) - 32768) * 4096) >> 15
         elif ph > (0x3FFFFFFF - dph):
-            # (equivalent to ph > 2^30 - dph, but the literal 0x40000000 is
-            # one over the 32-bit small-int limit and boxes under viper)
+            # cant write 0x40000000 - one over the 32bit small int limit,
+            # viper boxes it (found out the hard way on the badge)
             u = (ph - 0x3FFFFFFF - 1) // dq         # Q15 in (-1,0)
             s -= ((((u * u) >> 15) + u + u + 32768) * 4096) >> 15
         # Chamberlin SVF, 2x oversampled (stable to ~7 kHz cutoff)
@@ -162,10 +125,9 @@ def _blk_saw(out: ptr16, ob: int, n: int, st: ptr32, cf: ptr32):
             bp = 65535
         elif bp < -65536:
             bp = -65536
-        # SC order: amp env applied AFTER the filter (so the resonance is
-        # gated by the note, instead of ringing on after it ends)
+        # env after filter (SC order) so resonance gets gated
         o = (lp * (((g >> 8) * mg) >> 12)) >> 12
-        # cubic soft clip: y = 1.5u - u^3/2 (normalised), ceiling at 32768
+        # cubic soft clip, ceiling 32768
         if o > 32768:
             o = 32768
         elif o < -32768:
@@ -190,10 +152,6 @@ def _blk_saw(out: ptr16, ob: int, n: int, st: ptr32, cf: ptr32):
 
 @micropython.viper
 def _blk_pulse3(out: ptr16, ob: int, n: int, st: ptr32, cf: ptr32):
-    # st: [0..5]=phase/dphase x3  [6..7]=sub-octave phase/dphase
-    # st: [8..11]=lp/bp x2 (cascaded SVF, 24 dB/oct like Overtone's prophet)
-    # cf: [0]=f [1]=damp (Q14)  [2..3]=g0/g1 (Q12)  [4]=mg (Q12)
-    # cf: [5..7]=pulse widths, 30-bit phase units ([8]=sub width)
     p0 = int(st[0]); d0 = int(st[1])
     p1 = int(st[2]); d1 = int(st[3])
     p2 = int(st[4]); d2 = int(st[5])
@@ -226,7 +184,7 @@ def _blk_pulse3(out: ptr16, ob: int, n: int, st: ptr32, cf: ptr32):
             s += 1024
         else:
             s -= 1024
-        # sub-octave pulse (SP's prophet includes one; big part of its body)
+        # sub octave pulse - big part of the prophets body
         if p3 < w3:
             s += 1024
         else:
@@ -245,8 +203,7 @@ def _blk_pulse3(out: ptr16, ob: int, n: int, st: ptr32, cf: ptr32):
             bp = 65535
         elif bp < -65536:
             bp = -65536
-        # second SVF stage, fully damped -> 24 dB/oct without doubling
-        # the resonant peak
+        # 2nd stage damped -> 24dB/oct without doubling the res peak
         lq += (f * bq) >> 14
         hp = lp - lq - bq
         bq += (f * hp) >> 14
@@ -262,7 +219,6 @@ def _blk_pulse3(out: ptr16, ob: int, n: int, st: ptr32, cf: ptr32):
         elif bq < -65536:
             bq = -65536
         o = (lq * (((g >> 8) * mg) >> 12)) >> 12   # amp env post-filter
-        # cubic soft clip: y = 1.5u - u^3/2 (normalised), ceiling at 32768
         if o > 32768:
             o = 32768
         elif o < -32768:
@@ -292,7 +248,7 @@ def _blk_pulse3(out: ptr16, ob: int, n: int, st: ptr32, cf: ptr32):
 
 @micropython.viper
 def _blk_lp1(buf: ptr16, n: int, st: ptr32, k: int):
-    # in-place one-pole low-pass, k Q15; damps the S3 echo repeats
+    # one pole LP, damps the echo repeats
     y = int(st[0]) - 65536          # biased state, see _blk_saw
     i = 0
     while i < n:
@@ -327,8 +283,7 @@ def _blk_mix(out: ptr16, ob: int, src: ptr16, sb: int, n: int, g: int):
 
 
 if not _VIPER:
-    # In plain Python the ptr annotations are inert, so cast the sample
-    # buffers to uint16 views at the call boundary instead.
+    # cpython: annotations do nothing so cast at the call boundry
     _saw_k, _pulse_k, _mix_k = _blk_saw, _blk_pulse3, _blk_mix
 
     def _blk_saw(out, ob, n, st, cf):
@@ -346,19 +301,12 @@ if not _VIPER:
         return _lp1_k(ptr16(buf), n, st, k)
 
 
-# ---------------------------------------------------------------------------
-# control-rate glue
-# ---------------------------------------------------------------------------
 
 FC_MAX = 7000.0     # SVF (2x oversampled) stability ceiling
 
 
 def _svf_coefs(fc, rq):
-    """Resonant low-pass as a Chamberlin SVF, run at 2xSR inside the kernels.
-    damp == rq (rq is 1/Q, exactly SC's reciprocal-of-Q convention).
-    Q14 fixed point keeps ~1% coefficient precision even at the 46 Hz
-    tb303 cutoff floor, where a direct-form biquad in fixed point falls over.
-    """
+    """SVF coefs, Q14. damp == rq (SCs 1/Q convention)"""
     if fc < 20.0:
         fc = 20.0
     elif fc > FC_MAX:
@@ -372,10 +320,8 @@ def _svf_coefs(fc, rq):
 
 
 def _load_drums():
-    """Load the real Sonic Pi drum samples (bd_fat/bd_boom/bd_haus.pcm,
-    raw int16 mono 22050 Hz, shipped alongside this file), normalised to
-    peak 26000 so step amp is a plain musical gain. Falls back to a
-    synthesised kick if the files are missing."""
+    """load bd_*.pcm (real sonic pi samples, 22050 s16le) normalised to
+    peak 26000. falls back to a synthesised kick if missing"""
     try:
         base = __file__.rsplit('/', 1)[0]
     except (NameError, AttributeError):
@@ -385,7 +331,6 @@ def _load_drums():
         try:
             raw = open(base + '/bd_' + name + '.pcm', 'rb').read()
             buf = bytearray(raw)
-            # normalise to peak 26000 (integer scan, init-time only)
             pk = 1
             for i in range(0, len(buf), 2):
                 v = buf[i] | (buf[i + 1] << 8)
@@ -434,14 +379,12 @@ class StepRenderer:
         ns = int(dur * SR + 0.5)
         buf = bytearray(2 * ns)             # zero-filled
 
-        # --- synth voice ----------------------------------------------------
         if voice is not None and release > 0.0:
             self._render_voice(buf, ns, voice, midi, release,
                                cutoff, sp_res, slic)
 
-        # --- S3 pseudo-reverb: with_fx :reverb approximated as a one-step
-        # (125 ms) damped feedback echo, prophet voice only (kick is mixed
-        # afterwards and stays dry, so it can't flam through the echo) -----
+        # fake reverb for section 3: one step (125ms) damped feedback echo,
+        # voice only - kick mixed after so it cant flam thru the echo
         if voice == 'prophet':
             if self.echo is not None and len(self.echo) == len(buf):
                 _blk_mix(buf, 0, self.echo, 0, ns, 80)      # ~0.31 feedback
@@ -454,7 +397,7 @@ class StepRenderer:
             self.echo = None
             self._elp = 65536
 
-        # --- drum (non-blocking in Sonic Pi: tail carries across steps) ----
+        # drums dont block in sonic pi, tail carries across steps
         if kick_amp > 0.0:
             self.k_buf = self.drums.get(drum, self.drums['fat'])
             self.kick_pos = 0
@@ -470,9 +413,8 @@ class StepRenderer:
         freq = midicps(midi)
         cut_hz = midicps(cutoff)
         if voice != 'tb303':
-            # SP's shipped prophet binary is undocumented; empirically its
-            # spectrum sits much darker than midicps(cutoff) would suggest.
-            # Scale tuned against the model-village reference recording.
+            # prophets real filter is undocumented, this scale is tuned by
+            # ear/spectrum against the model village recording
             cut_hz *= 0.15
         rq = 1.0 - sp_res
         nrel = min(ns, int(release * SR) + 1)
@@ -515,7 +457,7 @@ class StepRenderer:
             else:
                 sg = 1.0
 
-            # filter env == amp env (same ADSR in the tb303 synthdef)
+            # filter env == amp env in the tb303 synthdef
             fc = CUTOFF_MIN_HZ + (e_prev / 16384.0) * cut_hz
             f, damp = _svf_coefs(fc, rq)
 

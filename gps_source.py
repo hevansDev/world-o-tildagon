@@ -1,25 +1,14 @@
-# GPS sources for world-o-techno.
+# gps sources. NmeaGps is a minimal GGA/RMC parser over UART, if you have
+# working gps code already just wrap it in the same interface.
 #
-# Both expose the same tiny interface the sequencer needs:
-#   has_fix() -> bool
-#   lat() / lon() -> float degrees (signed)
-#   speed() -> float (m/s; only speed % 1 is used, per the original)
-#   satellites() -> int
-#
-# NmeaGps is a minimal $..GGA/$..RMC parser over machine.UART. If you already
-# have working GPS-hexpansion code, wrap it in this interface instead - the
-# rest of the app doesn't care where positions come from.
+# next_cycle_ticks() is for syncing badges over gps time: timestamps timed
+# NMEA sentances and keeps the MIN (ticks - utc) offset - delays only ever
+# add so the minimum is closest to the truth. identical hexpansions share
+# the modules fixed sentence lag so it cancels between badges
 
-TEST_LAT = 52.0417343     # Bourton-on-the-Water model village
-# Two longitudes ~10 m apart at the model village select very different
-# chords (chord choice is modular arithmetic on lon*300000):
-#   -2.3757386 -> chord root 69 (A4)  - the doc-verified regression coords
-#   -2.3758267 -> chord root 45 (A2)  - matches the register of jarkman's
-#                                       model_village_WoT.wav recording
+TEST_LAT = 52.0417343     # Model village at EMF camp 2026
 TEST_LON = -2.3758267
 
-# HexpansionConfig.pin[] index used for the UART RX line (GPS TX -> badge RX).
-# HS1 = pin[0] ... HS4 = pin[3]. Swap these if you see no NMEA sentences.
 GPS_RX_PIN_IDX = 0
 GPS_TX_PIN_IDX = 1
 GPS_BAUD = 9600
@@ -62,7 +51,6 @@ class NmeaGps:
         self._fix = False
         self._buf = b""
 
-    # -- polling ------------------------------------------------------------
 
     def poll(self):
         """Call regularly (e.g. from an asyncio task)."""
@@ -116,7 +104,6 @@ class NmeaGps:
             deg = -deg
         return deg
 
-    # -- interface ------------------------------------------------------------
 
     def has_fix(self):
         return self._fix
