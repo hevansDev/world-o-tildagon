@@ -1,10 +1,14 @@
 [app]
 name = "World o Tildagon"
-menu = "Music"
-license = "MIT"
-
+category = ["Music"]
+ 
 [entry]
 class = "WorldOTechno"
-
+ 
 [metadata]
+author = "Hugh Evans"
 description = "GPS-driven acid techno. Port of jarkman's world-o-techno. Needs a PCM5102A I2S DAC hexpansion."
+license = "MIT"
+url = "https://github.com/hevansDev/world-o-tildagon"
+version = "1.0.0"
+ 
