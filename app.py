@@ -1,5 +1,5 @@
-
 import asyncio
+import math
 
 if not hasattr(asyncio, 'sleep_ms'):     # CPython badge simulator
     asyncio.sleep_ms = lambda ms: asyncio.sleep(ms / 1000)
@@ -12,6 +12,28 @@ from system.hexpansion.config import HexpansionConfig
 from .sequencer import Sequencer
 from .synth import StepRenderer, SR
 from .gps_source import MockGps, NmeaGps
+from .spectrum import Phrase
+
+# badge only bits, sim doesnt have these
+try:
+    import imu
+except ImportError:
+    imu = None
+try:
+    from tildagonos import tildagonos
+except ImportError:
+    tildagonos = None
+try:
+    from system.eventbus import eventbus
+    from system.patterndisplay.events import PatternDisable, PatternEnable
+except ImportError:
+    eventbus = None
+
+# speccy palette
+CYAN = [0, 1, 1]
+MAGENTA = [1, 0, 1]
+YELLOW = [1, 1, 0]
+WHITE = [1, 1, 1]
 
 DAC_BCK_PIN = 0    # HS1 -> BCK
 DAC_LRCK_PIN = 1   # HS2 -> LCK / LRCK / WS
@@ -48,6 +70,8 @@ class WorldOTechno(app.App):
         self.sim_mode = False
         self._pg_channel = None
         self.error = None
+        self._theta = 0.0          # ring rotation from badge tilt
+        self.level = 0.0           # audio level for the leds
 
     # ---------------- menus ----------------
 
@@ -112,6 +136,8 @@ class WorldOTechno(app.App):
         self.renderer = StepRenderer()
         self.seq = Sequencer(self.gps)
         self.running = True
+        if eventbus:
+            eventbus.emit(PatternDisable())   # our leds now
         self._tasks.append(asyncio.create_task(self._audio_task()))
         if isinstance(self.gps, NmeaGps):
             self._tasks.append(asyncio.create_task(self._gps_task()))
@@ -138,12 +164,25 @@ class WorldOTechno(app.App):
                 for step in steps:
                     if not self.running:
                         return
-                    if swriter is not None:
+                    buf = None
+                    if swriter is not None or self._pg_channel is not None:
                         buf = self.renderer.render(step)
+                        p = 0
+                        for i in range(0, len(buf) - 1, 512):
+                            v = buf[i] | (buf[i + 1] << 8)
+                            if v >= 32768:
+                                v -= 65536
+                            if v > p:
+                                p = v
+                            elif -v > p:
+                                p = -v
+                        if p / 32768 > self.level:
+                            self.level = p / 32768
+                    if swriter is not None:
                         swriter.write(buf)
                         await swriter.drain()
                     elif self._pg_channel is not None:
-                        await self._play_sim(self.renderer.render(step))
+                        await self._play_sim(buf)
                     else:
                         await asyncio.sleep_ms(int(step[0] * 1000))
                 await asyncio.sleep_ms(0)
@@ -179,6 +218,15 @@ class WorldOTechno(app.App):
             except Exception:
                 pass
             self._pg_channel = None
+        if tildagonos:
+            try:
+                for i in range(1, 13):
+                    tildagonos.leds[i] = (0, 0, 0)
+                tildagonos.leds.write()
+            except Exception:
+                pass
+        if eventbus:
+            eventbus.emit(PatternEnable())    # give the rainbow back
 
     # ---------------- framework ----------------
 
@@ -190,6 +238,49 @@ class WorldOTechno(app.App):
                 self.minimise()
         elif self.menu:
             self.menu.update(delta)
+        if self.state != STATE_RUNNING:
+            return
+        # ring follows badge tilt, beeline style. gravity vector gives us
+        # the down direction when the badges held up
+        if imu:
+            try:
+                ax, ay, az = imu.acc_read()
+                if ax * ax + ay * ay > 2.0:   # dead zone when flat on a table
+                    tgt = math.atan2(ax, ay)
+                    d = (tgt - self._theta + math.pi) % (2 * math.pi) - math.pi
+                    self._theta += 0.15 * d
+            except Exception:
+                pass
+        # leds pulse with the music, alternting speccy colours
+        if tildagonos and self.running:
+            try:
+                b = self.level
+                for i in range(1, 13):
+                    c = MAGENTA if i % 2 else CYAN
+                    tildagonos.leds[i] = (int(c[0] * 255 * b),
+                                          int(c[1] * 255 * b),
+                                          int(c[2] * 255 * b))
+                tildagonos.leds.write()
+            except Exception:
+                pass
+        self.level *= 0.82
+
+    def _write_phrase(self, ctx, params, bold=False):
+        # pikesleys Phrase wants an app with .overlays, give it a decoy.
+        # bold draws everything 4x with a small offset to fatten the strokes
+        class _O:
+            pass
+        o = _O()
+        o.overlays = []
+        Phrase(params).write(o)
+        d = params.get("scale", 1) * 0.6
+        offs = ((0, 0), (d, 0), (0, d), (d, d)) if bold else ((0, 0),)
+        for c in o.overlays:
+            for ox, oy in offs:
+                ctx.save()
+                ctx.translate(ox, oy)
+                c.draw(ctx)
+                ctx.restore()
 
     def draw(self, ctx):
         clear_background(ctx)
@@ -204,18 +295,30 @@ class WorldOTechno(app.App):
             ctx.move_to(0, 0).text(self.error[:36])
             ctx.rgb(1, 1, 1).move_to(0, 40).text("CANCEL to exit")
         elif self.gps and self.gps.has_fix():
-            ctx.rgb(0, 1, 0.6).font_size = 22
-            ctx.move_to(0, -60).text("world-o-techno")
-            ctx.font_size = 18
-            ctx.rgb(1, 1, 1)
-            ctx.move_to(0, -30).text("section %d" % (self.seq.section if self.seq else 0))
-            ctx.move_to(0, -8).text("root MIDI %d" % (self.seq.chord_root if self.seq else 0))
-            ctx.move_to(0, 18).text("%.5f" % self.gps.lat())
-            ctx.move_to(0, 40).text("%.5f" % self.gps.lon())
-            if self.sim_mode:
-                msg = ("sim audio: pygame" if self._pg_channel
-                       else "sim: no audio device")
-                ctx.rgb(1, 0.8, 0).move_to(0, 62).text(msg)
+            # coords round the edge in a small plain font, rotates with the
+            # badge. one char at a time, each rotated to face the middle
+            txt = "%.5f  %.5f" % (self.gps.lat(), self.gps.lon())
+            total = math.radians(300)
+            ctx.save()
+            ctx.rotate(self._theta)
+            ctx.font_size = 10
+            ctx.rgb(*CYAN)
+            n = len(txt)
+            for i, ch in enumerate(txt):
+                a = -total / 2 + total * i / (n - 1)
+                ctx.save()
+                ctx.rotate(a)
+                ctx.move_to(0, -112)   # right at the rim, clear of the title
+                ctx.text(ch)
+                ctx.restore()
+            ctx.restore()
+            # big chunky pikesley style title
+            self._write_phrase(ctx, {"text": "world", "scale": 3.5,
+                                     "y-offset": -48, "colour": MAGENTA}, bold=True)
+            self._write_phrase(ctx, {"text": "o", "scale": 3.5,
+                                     "y-offset": 0, "colour": YELLOW}, bold=True)
+            self._write_phrase(ctx, {"text": "techno", "scale": 3.5,
+                                     "y-offset": 48, "colour": CYAN}, bold=True)
         else:
             ctx.rgb(1, 0.8, 0).move_to(0, -20).text("waiting for fix...")
             sats = self.gps.satellites() if self.gps else 0

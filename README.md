@@ -39,3 +39,4 @@ Please feel free to raise issues and PRs. Couple of things to be aware of:
 - [Andrea Campanella](https://github.com/andreacampanella/BadgeRadio) from whom I heavily referenced for
   Tildagon I2S groundwork
 - [Sonic Pi](https://sonic-pi.net/) for the drum samples
+- [Pikesley](https://codeberg.org/pikesley/tildagon-badge-fest/src/branch/main/common/spectrum.py) Sinclair Spectrum font
